@@ -2,8 +2,10 @@ import os
 import sys
 import pdb
 import torch
-sys.path.append(r"/media/gauthierli-org/CodingSpace1/code/label_transfer/CFG")
+sys.path.append(r"CFG/")
+sys.path.append(r"utils/")
 
+import vis
 import cfg as CFG
 import numpy as np
 import torch.nn as nn
@@ -60,7 +62,7 @@ def cell_dataloader(dataset, nw=0):
 
 def flowers_dataloader(transform=None):
     transform = T.Compose([T.Resize((CFG.img_size, CFG.img_size)),T.ToTensor()])
-    ds = ImageFolder(CFG.data_path,transform=transform, target_transform=T.Lambda(lambda y:torch.eye(CFG.latent_dim)[y]))
+    ds = ImageFolder(CFG.data_path,transform=transform, target_transform=T.Lambda(lambda y:torch.eye(CFG.classes)[y]))
     return ds.class_to_idx, DataLoader(ds, batch_size=CFG.bs,num_workers=CFG.nw,shuffle=True,pin_memory=True, collate_fn=default_collate,drop_last=True)
 
 if __name__ == "__main__":
@@ -68,5 +70,8 @@ if __name__ == "__main__":
     print(map_dict)
     print(len(loader))
     for img, label in loader:
+        # pdb.set_trace()
+        print(img.shape)
+        vis.tensor_vue(img)
         print(img.shape, np.argmax(label))
         break

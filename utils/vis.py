@@ -1,3 +1,8 @@
+"""
+@author: Gauthier Li
+@email: lwklxh@163.com
+@date: 22/11/2022
+"""
 import os
 import pdb
 import time
@@ -43,7 +48,8 @@ class dynamic_pic():
                             plt.plot(self.data_base[it]["x"], self.data_base[it]["y"], label=it, color=self.cnames[i])
                         else:
                             plt.scatter(self.data_base[it]["x"], self.data_base[it]["y"], label=it, marker=".", color=self.cnames[i], linewidths=0.3)
-                plt.legend(loc="best")
+                if self.data_base[item]["mode"] != "figure":
+                    plt.legend(loc="best")
                 num += 1
             except KeyError:
                 print("\r Key {} not found".format(item), end="", flush=True)
@@ -104,13 +110,31 @@ class dynamic_pic():
     def __call__(self, x, y, category:str="base", mode="line", drop_mode="drop", drop_x=False):
         self._write(x, y, category, mode, drop_mode, drop_x)
 
+def tensor_vue(imgs:torch.tensor, col=4):
+    B = imgs.shape[0]
+    row = B // col
+    fig, axis = plt.subplots(row, col, figsize=(col*3, row*3))
+    for i,im in enumerate(imgs):
+        cur_row = i // col - 1
+        cur_rank = i % col - 1
+        im = im.detach().permute(1,2,0).cpu().numpy()
+        if row < 1:
+            axis[cur_rank].imshow(im)
+        else:
+            axis[cur_row][cur_rank].imshow(im)
+    plt.show()
+
 if __name__ == '__main__':
-    p1 = dynamic_pic(capacity=3000)
-    for i in range(1000):
-        # print((torch.randn(3, 2) / 5 + 2).numpy().T)
-        x1, y1 = (torch.randn(3, 2) / 5 + 2).numpy().T
-        x, y = (torch.randn(3, 2) / 5).numpy().T
-        p1(x, y, category="a", mode="scatter")
-        p1(x1, y1, category="b", mode="scatter")
-        # if i % 10 == 0:
-        p1.draw(joint=[["a", "b"]], row_max=1)
+    # p1 = dynamic_pic(capacity=3000)
+    # for i in range(1000):
+    #     # print((torch.randn(3, 2) / 5 + 2).numpy().T)
+    #     x1, y1 = (torch.randn(3, 2) / 5 + 2).numpy().T
+    #     x, y = (torch.randn(3, 2) / 5).numpy().T
+    #     p1(x, y, category="a", mode="scatter")
+    #     p1(x1, y1, category="b", mode="scatter")
+    #     # if i % 10 == 0:
+    #     p1.draw(joint=[["a", "b"]], row_max=1)
+
+    background = torch.zeros(4,5)
+    background[:,-1] = 1
+    print(background)

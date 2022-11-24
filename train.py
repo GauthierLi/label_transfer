@@ -1,7 +1,5 @@
-import sys 
-sys.path.append(r"/media/gauthierli-org/CodingSpace1/code/label_transfer/CFG")
-
 import os
+import sys
 import pdb
 import torch
 import numpy as np
@@ -11,10 +9,9 @@ import torch.optim as optim
 
 from tqdm import tqdm
 from utils.vis import dynamic_pic
-from models.miNets import TotalMI, LocalMI
 from torch.utils.data import Dataset, DataLoader
-from dataloaders.dataloader import cell_dataloader, flowers_dataloader
-from models.encoders import Encoder, Decoder, feature_compress, Discriminator, UnetEncoder, U2Encoder, U2Decoder
+from dataloaders.dataloader import flowers_dataloader
+from models.cycle_module import cycleBlock
 
 """
 rethinking: in order to give s robostic training, it's better to make some masks or noise to force the local mask to convergence.
@@ -24,91 +21,74 @@ the next trial: change the activate function into Gelu
 
 Vusialize_iter = 10
 
-def train_one_epoch(cur_epoch, models, train_loader, monitor):
-    total_recons_loss, total_mi_loss, total_label_loss = 0., 0., 0.
+def train_one_epoch(cur_epoch, train_loader, models,monitor):
+    total_loss = 0.
     N = len(train_loader)
-    pbar = tqdm(train_loader, desc=f"[epoch {epoch} training]")
-
-    recons_lf = nn.MSELoss()
-    bce_lf = nn.BCELoss()
-
-    for num, (img, label) in enumerate(pbar):
+    pbar = tqdm(train_loader)
+    lf = nn.BCELoss()
+    models['net'].train()
+    for num,(img, label) in enumerate(pbar):
+        models['opt'].zero_grad()
         img = img.to(cfg.device)
         label = label.to(cfg.device)
 
-        # 1 reconstract
-        models["encoder"]["net"].train()
-        models["decoder"]["net"].train()
-        models["feature_compress"]["net"].eval()
-        models["mi"]["net"].eval()
-        models["encoder"]["optim"].zero_grad()
-        models["decoder"]["optim"].zero_grad()
+        # first supervised
+        pred_label, pred_masks = models['net'](img)
+        # pdb.set_trace()
+        print(torch.argmax(pred_label[0]).item(), torch.argmax(label[0]).item())
+        cur_loss = lf(pred_label, label)
 
-        if cfg.net_type == "U2Net":
-            features = models["encoder"]["net"](img)
-            reconstruct = models["decoder"]["net"](features)
-            # pdb.set_trace()
-            recons_loss = 0
-            for rec in reconstruct:
-                recons_loss += recons_lf(img, rec)
+        class_of_obj = torch.argmax(pred_label,dim=1)
+        masks = torch.stack([pred_masks[i][class_of_obj[i]] for i in range(cfg.bs)], dim=0).detach()
+
+        if epoch % 2 > 10:
+            # second supervised
+            img1 = torch.mul(img, (1-masks).unsqueeze(dim=1)).detach()
+            img2 = torch.mul(img, masks.unsqueeze(dim=1)).detach()
+
+            pred_label1, pred_masks1 = models['net'](img1)
+            background = torch.zeros_like(pred_label1)
+            background[:,-1] = 1
+            cur_loss1 = lf(pred_label1, background)
+            pred_label2, pred_masks2 = models['net'](img2)
+            cur_loss2 = lf(pred_label2, label)
+
+            class_of_obj1 = torch.argmax(pred_label1,dim=1)
+            masks1 = torch.stack([pred_masks1[i][class_of_obj1[i]] for i in range(cfg.bs)], dim=0).detach()
+            class_of_obj2 = torch.argmax(pred_label2,dim=1)
+            masks2 = torch.stack([pred_masks2[i][class_of_obj2[i]] for i in range(cfg.bs)], dim=0).detach()
+
+            monitor(num, cur_loss2.item(), category="cur_loss2", mode="line", drop_x=True)
+            monitor(num, cur_loss1.item(), category="cur_loss1", mode="line", drop_x=True)
+
+            expect_true = cur_loss + cur_loss2
+            expect_false = cur_loss1
+            (expect_true + 0.01 * expect_false).backward()
+            models['opt'].step()
+
+            monitor(img2[0].permute(1,2,0).cpu().detach().numpy(), 0, category="img2", mode="figure")
+            monitor(nn.Softmax()(masks1[0]).cpu().detach().numpy(), 0, category="mask1", mode="figure")
+            monitor(nn.Softmax()(masks2[0]).cpu().detach().numpy(), 0, category="mask2", mode="figure")
         else:
-            feature = models["encoder"]["net"](img)
-            reconstruct = models["decoder"]["net"](feature)
-            recons_loss = recons_lf(img , reconstruct) 
-            
+            cur_loss.backward()
+            models['opt'].step()
 
-        total_recons_loss += recons_loss.item()
-        if num % Vusialize_iter == 0:
-            monitor(num, recons_loss.item(), category="recons", mode="line", drop_x=True)
-            monitor((255 * img[0].permute(1,2,0).cpu().detach().numpy()).astype("uint8"), 0, category="ori", mode="figure")
-            if cfg.net_type == "U2Net":
-                monitor((255 * reconstruct[0][0].permute(1,2,0).cpu().detach().numpy()).astype("uint8"), 0, category="rec", mode="figure")
-            else:
-                monitor((255 * reconstruct[0].permute(1,2,0).cpu().detach().numpy()).astype("uint8"), 0, category="rec", mode="figure")
-        recons_loss.backward()
+        monitor(num, cur_loss.item(), category="cur_loss0", mode="line", drop_x=True)
+        monitor(img[0].permute(1,2,0).cpu().detach().numpy(), 0, category="img", mode="figure")
+        monitor(nn.Softmax()(masks[0]).cpu().detach().numpy(), 0, category="mask0", mode="figure")
+        
 
-        # 2. maximum mi and minimize label loss
-        models["encoder"]["net"].train()
-        models["feature_compress"]["net"].train()
-        models["mi"]["net"].train()
-        models["decoder"]["net"].eval()
-        models["encoder"]["optim"].zero_grad()
-        models["feature_compress"]["optim"].zero_grad()
-        models["mi"]["optim"].zero_grad()
+        pbar.desc = "[epoch:{:}, lr:{:.6f} loss {:.4f}]"\
+                    .format(cur_epoch, models['opt'].state_dict()['param_groups'][0]['lr'],cur_loss.item())
 
-        if cfg.net_type == "U2Net":
-            feature = models["encoder"]["net"](img)[-1]
-        else:
-            feature = models["encoder"]["net"](img)
-        representation = models["feature_compress"]["net"](feature)
-
-        mi_loss = models["mi"]["net"](feature, representation) # + torch.norm(representation, p=2, dim=1).mean()
-        label_loss = bce_lf(representation, label)
-        total_mi_loss += mi_loss.item()
-        total_label_loss += label_loss.item()
-        if num % Vusialize_iter == 0:
-            monitor(num, mi_loss.item(), category="mi loss", drop_x=True)
-            monitor(num, label_loss.item(), category="label loss", drop_x=True)
-        mi_label_loss = mi_loss + 10 * label_loss
-
-        mi_label_loss.backward()
-        models["encoder"]["optim"].step()
-        models["decoder"]["optim"].step()
-        models["feature_compress"]["optim"].step()
-        models["mi"]["optim"].step()
-
-        # vusualize_mask
-        if num % Vusialize_iter == 0:
-            mask = models["mi"]["net"].lmi(feature, representation, False)
-            monitor(((mask[0] * 255).detach().cpu().numpy()).astype("uint8"),0, category="mask", mode="figure")
-            # draw
-            monitor.draw(joint=["recons", "mi loss","label loss" , "ori", "rec", "mask"],
-                        row_max=2, pause=0, save_path=os.path.join(cfg.log_img, "view.png"))
-
-    total = total_recons_loss / N + total_mi_loss / N + total_label_loss / N
-    monitor.draw(joint=["recons", "mi loss","label loss" , "ori", "rec", "mask"], 
-                    row_max=2, pause=0, save_path=os.path.join(cfg.log_img, f"epoch{epoch}.png"))
-    return total
+        # draw 
+        if num % 10 == 0:
+            monitor.draw(joint=["img", "img2", "mask0", "mask1", 'mask2', 'cur_loss0',  'cur_loss2' ,'cur_loss1'],
+                        row_max=3, pause=0, save_path=os.path.join(cfg.log_img, "view.png"))
+    monitor.draw(joint=["img", "img2", "mask0", "mask1", 'mask2', 'cur_loss0',  'cur_loss2' ,'cur_loss1'],
+                        row_max=3, pause=0, save_path=os.path.join(cfg.log_img, f"epoch_{cur_epoch}.png"))
+    
+    return total_loss / float(N)
 
 if __name__ == "__main__":
     if not os.path.isdir(cfg.ckpt_path):
@@ -120,59 +100,16 @@ if __name__ == "__main__":
     mapdict, train_loader = flowers_dataloader()
     print(mapdict)
 
-    if cfg.net_type == "U2Net":
-        encoder = U2Encoder(latent_dim=cfg.latent_dim).to(cfg.device)
-        decoder = U2Decoder().to(cfg.device)
-        tmi_loss = TotalMI().to(cfg.device)
-    else:
-        encoder = UnetEncoder(latent_dim=cfg.latent_dim).to(cfg.device)
-        decoder = Decoder().to(cfg.device)
-        tmi_loss = TotalMI().to(cfg.device)
-    fea_compress = feature_compress().to(cfg.device)
-    discrim = Discriminator().to(cfg.device)
+    net = cycleBlock().to(cfg.device)
+    optimizer = optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
+    lr_schedule = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=24,T_mult=2,eta_min=1e-6)
 
-    optim_en = optim.AdamW(encoder.parameters(), lr=cfg.lr,weight_decay=cfg.wd)
-    optim_de = optim.AdamW(decoder.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
-    optim_feac = optim.AdamW(fea_compress.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
-    optim_tmi = optim.AdamW(tmi_loss.parameters(), lr=cfg.lr)
-    optim_discrim = optim.AdamW(discrim.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
-
-
-    lrscd_en = optim.lr_scheduler.ExponentialLR(optim_en, gamma=0.1)
-    lrscd_de = optim.lr_scheduler.ExponentialLR(optim_de, gamma=0.1)
-    lrscd_feac = optim.lr_scheduler.ExponentialLR(optim_feac, gamma=0.1)
-    lrscd_tmi = optim.lr_scheduler.ExponentialLR(optim_tmi, gamma=0.1)
-    lrscd_discrim = optim.lr_scheduler.ExponentialLR(optim_discrim, gamma=0.1)
-
-    # lrscd_en = optim.lr_scheduler.CosineAnnealingWarmRestarts(optim_en, T_0=10, T_mult=2, eta_min=1e-8)
-    # lrscd_de = optim.lr_scheduler.CosineAnnealingWarmRestarts(optim_de, T_0=10, T_mult=2, eta_min=1e-8)
-    # lrscd_feac = optim.lr_scheduler.CosineAnnealingWarmRestarts(optim_feac, T_0=10, T_mult=2, eta_min=1e-8)
-    # lrscd_mi = optim.lr_scheduler.CosineAnnealingWarmRestarts(optim_mi, T_0=10, T_mult=2, eta_min=1e-8)
-    # lrscd_discrim = optim.lr_scheduler.CosineAnnealingWarmRestarts(optim_discrim, T_0=10, T_mult=2, eta_min=1e-8)
-
-
-    models = {"encoder": {"net":encoder, "optim":optim_en, "lr_scd": lrscd_en},
-              "decoder": {"net":decoder, "optim":optim_de, "lr_scd": lrscd_de},
-              "feature_compress": {"net":fea_compress, "optim":optim_feac, "lr_scd": lrscd_feac},
-              "mi":{"net":tmi_loss, "optim":optim_tmi, "lr_scd": lrscd_tmi},
-              "discriminator":{"net":discrim, "optim":optim_discrim, "lr_scd": lrscd_discrim}}
-    
-    if cfg.resume:
-        ckpt = torch.load(cfg.resume_path)
-        cur_epoch = ckpt['epoch']
-        for key in models:
-            models[key]["net"].load_state_dict(ckpt[key])
-
+    models_dict = {"net":net, "opt":optimizer, "lr_sch":lr_schedule}
     best_loss = 999999999999999
-    for epoch in range(cur_epoch, cfg.epoch) if cfg.resume else range(cfg.epoch):
-        loss = train_one_epoch(epoch, models,train_loader, monitor)
-        for key in models:
-            models[key]["lr_scd"].step()
-
-        ckpt = dict()
-        for key in models:
-            ckpt[key] = models[key]["net"].state_dict()
-        ckpt['epoch'] = epoch
+    for epoch in range(cfg.epoch):
+        loss = train_one_epoch(epoch, train_loader, models_dict, monitor)
+        models_dict['lr_sch'].step()
+        ckpt = {"state_dict":models_dict['net'].state_dict(), "epoch":epoch}
         torch.save(ckpt, os.path.join(cfg.ckpt_path, f"last_epoch.pth"))
         if loss < best_loss:
             best_loss = loss
